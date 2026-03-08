@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+*.db
+*.log
+.env
+credentials.py
+*.txt
+\!requirements.txt
+.vscode/
+.ruff_cache/

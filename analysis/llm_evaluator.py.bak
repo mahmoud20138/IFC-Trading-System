@@ -1,0 +1,398 @@
+"""
+IFC Trading System — LLM Second Evaluation Engine
+Enhancement Plan Feature A: LLM Second Opinion
+
+Sends structured layer data to an LLM (OpenAI GPT-4 / Google Gemini /
+local Ollama) and returns agreement/disagreement, risk assessment,
+key concerns, and sizing suggestions.
+
+Results are cached per symbol for 5 minutes.
+"""
+
+import json
+import time
+import hashlib
+from typing import Dict, Any, Optional, List
+
+from analysis.layer1_intermarket import LayerSignal
+from config import settings
+from utils.helpers import setup_logging
+
+logger = setup_logging("ifc.llm_eval")
+
+# ══════════════════════════════════════════════════════════════════
+# CONFIG  (read from settings, with safe defaults)
+# ══════════════════════════════════════════════════════════════════
+LLM_BACKEND = getattr(settings, "LLM_BACKEND", "openai")       # "openai" | "gemini" | "ollama"
+LLM_MODEL = getattr(settings, "LLM_MODEL", "gpt-4o-mini")
+LLM_TEMPERATURE = getattr(settings, "LLM_TEMPERATURE", 0.3)
+LLM_MAX_TOKENS = getattr(settings, "LLM_MAX_TOKENS", 1000)
+LLM_CACHE_TTL = getattr(settings, "LLM_CACHE_TTL", 300)        # 5 minutes
+LLM_TIMEOUT = getattr(settings, "LLM_TIMEOUT", 30)
+
+# ══════════════════════════════════════════════════════════════════
+# MODULE-LEVEL CACHE  {symbol_hash: {"response": ..., "ts": ...}}
+# ══════════════════════════════════════════════════════════════════
+_llm_cache: Dict[str, Dict[str, Any]] = {}
+
+
+# ══════════════════════════════════════════════════════════════════
+# PROMPT BUILDER
+# ══════════════════════════════════════════════════════════════════
+SYSTEM_PROMPT = """You are an expert institutional forex / CFD trader and risk manager.
+You receive a structured analysis of a potential trade from an 11-layer automated system.
+Your job is to provide an honest second opinion.
+
+Respond ONLY in valid JSON with these exact keys:
+{
+  "agrees": true/false,
+  "risk_score": 1-10 (1=very safe, 10=extremely risky),
+  "direction_opinion": "LONG" / "SHORT" / "NO_TRADE",
+  "key_concerns": ["concern1", "concern2"],
+  "confirmations": ["positive1", "positive2"],
+  "size_adjustment": 0.0-1.5 (1.0=normal, <1=reduce, >1=increase),
+  "reasoning": "2-3 sentence explanation",
+  "confidence": 0.0-1.0
+}
+
+Rules:
+- Be contrarian if the data warrants it
+- Flag any layer scores that seem inconsistent
+- Consider macro regime, correlation risk, and timing
+- If multiple veto conditions exist, strongly recommend NO_TRADE
+- Crypto and stocks have different risk profiles than forex"""
+
+
+def _build_user_prompt(
+    symbol: str,
+    signals: List[LayerSignal],
+    evaluation: Dict[str, Any],
+    regime: Dict[str, Any],
+    intermarket_snapshot: Optional[Dict] = None,
+) -> str:
+    """Build the structured prompt sent to the LLM."""
+    layers_data = []
+    for sig in signals:
+        layers_data.append({
+            "layer": sig.layer_name,
+            "score": sig.score,
+            "direction": sig.direction,
+            "confidence": sig.confidence,
+            "key_details": {k: v for k, v in (sig.details or {}).items()
+                           if k not in ("snapshot_summary",)},  # Skip verbose data
+        })
+
+    prompt_data = {
+        "symbol": symbol,
+        "system_grade": evaluation.get("grade", "?"),
+        "system_direction": evaluation.get("direction", "?"),
+        "tws": evaluation.get("tws", 0),
+        "qas": evaluation.get("qas", 0),
+        "tradeable": evaluation.get("tradeable", False),
+        "verdict": evaluation.get("verdict", "?"),
+        "hard_vetos": evaluation.get("hard_vetos", []),
+        "soft_vetos": evaluation.get("soft_vetos", []),
+        "regime": regime.get("regime", "UNKNOWN"),
+        "regime_size_adj": regime.get("size_adjustment", 1.0),
+        "layers": layers_data,
+    }
+
+    # Add intermarket summary if available
+    if intermarket_snapshot:
+        im_summary = {}
+        for k, v in intermarket_snapshot.items():
+            if isinstance(v, dict):
+                im_summary[k] = f"{v.get('direction', '?')} ({v.get('change_pct', 0):+.1f}%)"
+        prompt_data["intermarket"] = im_summary
+
+    return (
+        f"Analyze this trade signal and provide your second opinion:\n\n"
+        f"```json\n{json.dumps(prompt_data, indent=2, default=str)}\n```"
+    )
+
+
+def _cache_key(symbol: str, evaluation: Dict) -> str:
+    """Generate cache key from symbol + grade + direction."""
+    grade = evaluation.get("grade", "?")
+    direction = evaluation.get("direction", "?")
+    return hashlib.md5(f"{symbol}:{grade}:{direction}".encode()).hexdigest()
+
+
+# ══════════════════════════════════════════════════════════════════
+# BACKEND CALLERS
+# ══════════════════════════════════════════════════════════════════
+
+def _call_openai(system_prompt: str, user_prompt: str) -> str:
+    """Call OpenAI API (GPT-4 / GPT-4o-mini)."""
+    try:
+        from config import credentials
+        api_key = getattr(credentials, "OPENAI_API_KEY", "")
+        if not api_key:
+            return json.dumps({"error": "OPENAI_API_KEY not set in credentials.py"})
+
+        import openai
+        client = openai.OpenAI(api_key=api_key, timeout=LLM_TIMEOUT)
+        response = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=LLM_TEMPERATURE,
+            max_tokens=LLM_MAX_TOKENS,
+            response_format={"type": "json_object"},
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error("OpenAI call failed: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+def _call_gemini(system_prompt: str, user_prompt: str) -> str:
+    """Call Google Gemini API."""
+    try:
+        from config import credentials
+        api_key = getattr(credentials, "GEMINI_API_KEY", "")
+        if not api_key:
+            return json.dumps({"error": "GEMINI_API_KEY not set in credentials.py"})
+
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            getattr(settings, "LLM_MODEL", "gemini-1.5-flash"),
+            system_instruction=system_prompt,
+        )
+        response = model.generate_content(
+            user_prompt,
+            generation_config=genai.GenerationConfig(
+                temperature=LLM_TEMPERATURE,
+                max_output_tokens=LLM_MAX_TOKENS,
+            ),
+        )
+        return response.text
+    except Exception as e:
+        logger.error("Gemini call failed: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+def _call_ollama(system_prompt: str, user_prompt: str) -> str:
+    """Call local Ollama instance."""
+    try:
+        from config import credentials
+        endpoint = getattr(credentials, "OLLAMA_ENDPOINT", "http://localhost:11434")
+        model = getattr(settings, "LLM_MODEL", "llama3.1")
+
+        import requests
+        resp = requests.post(
+            f"{endpoint}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "format": "json",
+                "stream": False,
+                "options": {
+                    "temperature": LLM_TEMPERATURE,
+                    "num_predict": max(2000, LLM_MAX_TOKENS),
+                },
+            },
+            timeout=max(120, LLM_TIMEOUT),
+        )
+        resp.raise_for_status()
+        content = resp.json().get("message", {}).get("content", "")
+        if not content or not content.strip():
+            logger.warning("Ollama returned empty response for model %s", model)
+            return json.dumps({"error": "Empty response from Ollama — model may still be loading"})
+        return content
+    except Exception as e:
+        logger.error("Ollama call failed: %s", e)
+        return json.dumps({"error": str(e)})
+
+
+_BACKENDS = {
+    "openai": _call_openai,
+    "gemini": _call_gemini,
+    "ollama": _call_ollama,
+}
+
+
+def _parse_llm_response(raw: str) -> Dict[str, Any]:
+    """Parse LLM JSON response, with fallback for markdown-wrapped JSON."""
+    if not raw or not raw.strip():
+        return {
+            "error": "Empty LLM response",
+            "agrees": None,
+            "risk_score": 5,
+            "direction_opinion": "NO_TRADE",
+            "reasoning": "LLM returned empty response — try a different model or increase timeout",
+            "confidence": 0.0,
+        }
+
+    text = raw.strip()
+
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+
+    # Try to extract JSON from mixed text (some models output text + JSON)
+    if not text.startswith("{"):
+        import re
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+        if json_match:
+            text = json_match.group(0)
+
+    try:
+        result = json.loads(text)
+        # Validate required keys
+        expected = {"agrees", "risk_score", "direction_opinion", "reasoning"}
+        if not expected.issubset(set(result.keys())):
+            missing = expected - set(result.keys())
+            result["_warning"] = f"Missing keys: {missing}"
+        return result
+    except json.JSONDecodeError as e:
+        return {
+            "error": f"Failed to parse LLM response: {e}",
+            "raw_response": raw[:500],
+            "agrees": None,
+            "risk_score": 5,
+            "direction_opinion": "NO_TRADE",
+            "reasoning": "LLM response was not valid JSON — try a different model",
+            "confidence": 0.0,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN API
+# ══════════════════════════════════════════════════════════════════
+
+def evaluate_with_llm(
+    symbol: str,
+    signals: List[LayerSignal],
+    evaluation: Dict[str, Any],
+    regime: Dict[str, Any],
+    intermarket_snapshot: Optional[Dict] = None,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """
+    Get LLM second opinion on a trade signal.
+
+    Parameters
+    ----------
+    symbol : MT5 symbol
+    signals : List of 11 LayerSignals
+    evaluation : Result from full_evaluation()
+    regime : Regime detection result
+    intermarket_snapshot : Current intermarket data
+    force_refresh : Bypass cache
+
+    Returns
+    -------
+    Dict with agrees, risk_score, direction_opinion, key_concerns,
+    confirmations, size_adjustment, reasoning, confidence, backend, cached.
+    """
+    # Check cache first
+    key = _cache_key(symbol, evaluation)
+    now = time.time()
+
+    if not force_refresh and key in _llm_cache:
+        cached = _llm_cache[key]
+        if now - cached["ts"] < LLM_CACHE_TTL:
+            result = cached["response"].copy()
+            result["cached"] = True
+            result["cache_age_s"] = round(now - cached["ts"])
+            return result
+
+    # Build prompt
+    user_prompt = _build_user_prompt(
+        symbol, signals, evaluation, regime, intermarket_snapshot,
+    )
+
+    # Call backend
+    backend = LLM_BACKEND.lower()
+    caller = _BACKENDS.get(backend)
+    if caller is None:
+        return {
+            "error": f"Unknown LLM backend: {backend}. Use 'openai', 'gemini', or 'ollama'.",
+            "agrees": None,
+            "risk_score": 5,
+            "direction_opinion": "NO_TRADE",
+            "reasoning": "Backend not configured",
+            "confidence": 0.0,
+        }
+
+    logger.info("Calling LLM (%s/%s) for %s...", backend, LLM_MODEL, symbol)
+    t0 = time.time()
+    raw_response = caller(SYSTEM_PROMPT, user_prompt)
+    elapsed = time.time() - t0
+    logger.info("LLM responded in %.1fs", elapsed)
+
+    # Parse
+    result = _parse_llm_response(raw_response)
+    result["backend"] = backend
+    result["model"] = LLM_MODEL
+    result["latency_s"] = round(elapsed, 2)
+    result["cached"] = False
+    result["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Cache it
+    _llm_cache[key] = {"response": result, "ts": now}
+
+    # Evict stale cache entries
+    stale_keys = [k for k, v in _llm_cache.items() if now - v["ts"] > LLM_CACHE_TTL * 3]
+    for k in stale_keys:
+        del _llm_cache[k]
+
+    return result
+
+
+def is_llm_configured() -> bool:
+    """Check if at least one LLM backend has credentials configured."""
+    try:
+        from config import credentials
+        backends = {
+            "openai": getattr(credentials, "OPENAI_API_KEY", ""),
+            "gemini": getattr(credentials, "GEMINI_API_KEY", ""),
+            "ollama": getattr(credentials, "OLLAMA_ENDPOINT", ""),
+        }
+        return any(v for v in backends.values())
+    except ImportError:
+        return False
+
+
+def get_available_backends() -> List[str]:
+    """Return list of backends with credentials configured."""
+    available = []
+    try:
+        from config import credentials
+        if getattr(credentials, "OPENAI_API_KEY", ""):
+            available.append("openai")
+        if getattr(credentials, "GEMINI_API_KEY", ""):
+            available.append("gemini")
+        if getattr(credentials, "OLLAMA_ENDPOINT", ""):
+            available.append("ollama")
+    except ImportError:
+        pass
+    return available
+
+
+def fetch_ollama_models() -> List[Dict[str, Any]]:
+    """
+    Fetch the list of locally installed Ollama models via the API.
+    Returns list of dicts with 'name', 'size', 'modified_at' etc.
+    Falls back to empty list on failure.
+    """
+    try:
+        import requests
+        from config import credentials
+        endpoint = getattr(credentials, "OLLAMA_ENDPOINT", "http://localhost:11434")
+        resp = requests.get(f"{endpoint}/api/tags", timeout=5)
+        resp.raise_for_status()
+        models = resp.json().get("models", [])
+        return models
+    except Exception as e:
+        logger.debug("Failed to fetch Ollama models: %s", e)
+        return []

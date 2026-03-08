@@ -1,0 +1,604 @@
+"""
+IFC Trading System — Pro Monitor
+Single-screen professional live dashboard monitoring ALL instruments.
+Real-time scores, trade signals with reasoning, and clean indicators.
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import time
+import traceback
+from datetime import datetime, timezone
+from typing import Dict, List, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+# ─── CSS Injection ────────────────────────────────────────────────────
+def inject_pro_css():
+    st.markdown("""
+    <style>
+        /* Dark pro theme overrides */
+        .main .block-container { padding-top: 1rem; max-width: 100%; }
+        section[data-testid="stSidebar"] { width: 220px !important; }
+
+        /* Instrument cards */
+        .inst-card {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border: 1px solid #2a2a4a;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin: 4px 0;
+            transition: all 0.2s;
+        }
+        .inst-card:hover { border-color: #4a9eff; box-shadow: 0 0 15px rgba(74,158,255,0.15); }
+        .inst-card.long-signal { border-left: 4px solid #00e676; }
+        .inst-card.short-signal { border-left: 4px solid #ff5252; }
+        .inst-card.neutral-signal { border-left: 4px solid #546e7a; }
+
+        .inst-name { font-size: 15px; font-weight: 700; color: #e0e0e0; margin: 0; }
+        .inst-cat { font-size: 10px; color: #78909c; text-transform: uppercase; letter-spacing: 1px; }
+        .inst-price { font-size: 18px; font-weight: 700; color: #fff; }
+
+        /* Score bar */
+        .score-bar-bg {
+            height: 6px; background: #263238; border-radius: 3px;
+            overflow: hidden; margin: 6px 0;
+        }
+        .score-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+
+        /* Grade badges */
+        .grade-badge {
+            display: inline-block; padding: 2px 10px; border-radius: 4px;
+            font-size: 12px; font-weight: 700; letter-spacing: 0.5px;
+        }
+        .grade-aplus { background: #00c853; color: #000; }
+        .grade-a { background: #00e676; color: #000; }
+        .grade-b { background: #ffc107; color: #000; }
+        .grade-no { background: #455a64; color: #90a4ae; }
+
+        /* Direction badges */
+        .dir-long { color: #00e676; font-weight: 700; }
+        .dir-short { color: #ff5252; font-weight: 700; }
+        .dir-neutral { color: #78909c; }
+
+        /* Signal card (potential trades) */
+        .signal-card {
+            background: linear-gradient(135deg, #0d2137 0%, #0a1929 100%);
+            border: 1px solid #1a4a7a;
+            border-radius: 14px;
+            padding: 18px 20px;
+            margin: 8px 0;
+        }
+        .signal-card.hot { border-color: #00e676; box-shadow: 0 0 20px rgba(0,230,118,0.12); }
+        .signal-card.warm { border-color: #ffc107; box-shadow: 0 0 15px rgba(255,193,7,0.08); }
+
+        .signal-header { display: flex; justify-content: space-between; align-items: center; }
+        .signal-name { font-size: 20px; font-weight: 800; color: #fff; }
+        .signal-reason { color: #b0bec5; font-size: 13px; line-height: 1.5; margin-top: 8px; }
+
+        /* Layer mini bar */
+        .layer-mini { display: inline-block; width: 18px; height: 18px; border-radius: 3px;
+                       margin: 1px; text-align: center; font-size: 9px; line-height: 18px;
+                       font-weight: 600; }
+        .layer-pass { background: #1b5e20; color: #69f0ae; }
+        .layer-fail { background: #b71c1c30; color: #ef9a9a; }
+        .layer-mid  { background: #e65100; color: #ffcc02; }
+
+        /* Stats row */
+        .stat-box {
+            background: #0d1b2a; border: 1px solid #1b3a5a; border-radius: 10px;
+            padding: 12px 16px; text-align: center;
+        }
+        .stat-value { font-size: 22px; font-weight: 800; color: #fff; }
+        .stat-label { font-size: 11px; color: #78909c; text-transform: uppercase; letter-spacing: 0.5px; }
+
+        /* Scrollable table */
+        .stDataFrame { font-size: 13px !important; }
+
+        /* Tabs */
+        .stTabs [data-baseweb="tab-list"] { gap: 2px; }
+        .stTabs [data-baseweb="tab"] {
+            background: #1a1a2e; border-radius: 8px 8px 0 0;
+            padding: 8px 16px; color: #90a4ae;
+        }
+        .stTabs [aria-selected="true"] {
+            background: #16213e; color: #4a9eff; border-bottom: 2px solid #4a9eff;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────
+def grade_badge(grade: str) -> str:
+    cls = {"A+": "grade-aplus", "A": "grade-a", "B": "grade-b"}.get(grade, "grade-no")
+    return f'<span class="grade-badge {cls}">{grade}</span>'
+
+
+def dir_badge(direction: str) -> str:
+    if direction == "LONG":
+        return '<span class="dir-long">▲ LONG</span>'
+    elif direction == "SHORT":
+        return '<span class="dir-short">▼ SHORT</span>'
+    return '<span class="dir-neutral">— NEUTRAL</span>'
+
+
+def score_color(score: float) -> str:
+    if score >= 7.5:
+        return "#00e676"
+    elif score >= 6.0:
+        return "#66bb6a"
+    elif score >= 4.5:
+        return "#ffc107"
+    elif score >= 3.0:
+        return "#ff9800"
+    return "#ff5252"
+
+
+def layer_mini_bars(signals) -> str:
+    from config.settings import LAYER_PASS_THRESHOLD
+    html = ""
+    for sig in signals:
+        if sig.score >= LAYER_PASS_THRESHOLD:
+            cls = "layer-pass"
+        elif sig.score >= LAYER_PASS_THRESHOLD - 1:
+            cls = "layer-mid"
+        else:
+            cls = "layer-fail"
+        label = sig.layer_name.replace("L", "").split("_")[0]
+        html += f'<span class="layer-mini {cls}" title="{sig.layer_name}: {sig.score:.1f}">{label}</span>'
+    return html
+
+
+def format_price(price: float, pip_size: float) -> str:
+    if pip_size >= 1.0:
+        return f"{price:,.1f}"
+    elif pip_size >= 0.01:
+        return f"{price:,.2f}"
+    elif pip_size >= 0.001:
+        return f"{price:,.3f}"
+    return f"{price:,.5f}"
+
+
+# ─── Analysis Runner ─────────────────────────────────────────────────
+@st.cache_data(ttl=45, show_spinner=False)
+def _scan_all_instruments() -> Dict[str, Any]:
+    """Run fast analysis on ALL active instruments. Cached 45s."""
+    from config.instruments import get_active_instruments
+    from data.mt5_connector import MT5Connector
+    from data.intermarket import IntermarketData
+    from analysis.layer1_intermarket import IntermarketLayer, LayerSignal
+    from analysis.pipeline import AnalysisPipeline
+
+    mt5 = MT5Connector()
+    mt5.connect()
+    im = IntermarketData()
+    snapshot = None
+    try:
+        snapshot = im.get_full_snapshot()
+    except Exception:
+        snapshot = {}
+
+    intermarket_layer = IntermarketLayer(im)
+    instruments = get_active_instruments()
+    results = {}
+
+    for inst in instruments:
+        try:
+            pipeline = AnalysisPipeline()
+            sym = inst.mt5_symbol
+
+            # Fetch multi-TF data
+            df_d1 = mt5.get_ohlcv(sym, "D1", 200)
+            df_h4 = mt5.get_ohlcv(sym, "H4", 200)
+            df_h1 = mt5.get_ohlcv(sym, "H1", 300)
+            df_m15 = mt5.get_ohlcv(sym, "M15", 300)
+
+            if df_d1 is None or df_d1.empty:
+                results[sym] = {"error": "No data", "instrument": inst}
+                continue
+
+            pipe_result = pipeline.run(
+                instrument=inst,
+                intermarket_layer=intermarket_layer,
+                df_d1=df_d1,
+                df_h4=df_h4,
+                df_h1=df_h1,
+                df_m15=df_m15,
+                intermarket_snapshot=snapshot,
+            )
+
+            # Extract key info
+            price = pipe_result.current_price
+            signals = pipe_result.signals
+            avg_score = sum(s.score for s in signals) / len(signals) if signals else 0
+            pass_count = sum(1 for s in signals if s.score >= 6.0) if signals else 0
+
+            # Build reasoning from top layers
+            reasons = []
+            for s in sorted(signals, key=lambda x: x.score, reverse=True)[:3]:
+                if s.score >= 6.0:
+                    detail = ""
+                    if s.details:
+                        for k in ["trend_alignment", "note", "regime", "killzone", "session", "sentiment_direction"]:
+                            if k in s.details and s.details[k]:
+                                detail = str(s.details[k])
+                                break
+                    reasons.append(f"{s.layer_name.replace('_', ' ')}: {s.score:.0f}/10{(' — ' + detail) if detail else ''}")
+
+            # Weak points
+            weak = []
+            for s in sorted(signals, key=lambda x: x.score)[:2]:
+                if s.score < 5.0:
+                    weak.append(f"{s.layer_name.replace('_', ' ')}: {s.score:.0f}/10")
+
+            results[sym] = {
+                "instrument": inst,
+                "price": price,
+                "signals": signals,
+                "grade": pipe_result.grade,
+                "direction": pipe_result.direction,
+                "tradeable": pipe_result.tradeable,
+                "avg_score": avg_score,
+                "pass_count": pass_count,
+                "total_layers": len(signals),
+                "regime": pipe_result.regime.get("regime", "?"),
+                "confluence": pipe_result.confluence,
+                "evaluation": pipe_result.evaluation,
+                "reasons": reasons,
+                "weak": weak,
+                "qas": pipe_result.confluence.get("qas", 0),
+                "tws": pipe_result.confluence.get("tws", 0),
+                "elapsed_ms": pipe_result.elapsed_ms,
+                "error": None,
+            }
+        except Exception as e:
+            results[inst.mt5_symbol] = {
+                "error": str(e),
+                "instrument": inst,
+                "price": 0,
+                "grade": "ERR",
+                "direction": "NEUTRAL",
+                "tradeable": False,
+                "avg_score": 0,
+                "pass_count": 0,
+                "total_layers": 0,
+                "signals": [],
+                "reasons": [],
+                "weak": [],
+                "qas": 0,
+                "tws": 0,
+                "regime": "?",
+                "elapsed_ms": 0,
+            }
+
+    return results
+
+
+# ─── Render Functions ─────────────────────────────────────────────────
+def _render_account_bar():
+    """Top account bar."""
+    try:
+        from data.mt5_connector import MT5Connector
+        mt5 = MT5Connector()
+        mt5.connect()
+        acct = mt5.get_account_info()
+        positions = mt5.get_open_positions()
+
+        balance = acct.get("balance", 0)
+        equity = acct.get("equity", 0)
+        floating = equity - balance
+        margin_level = acct.get("margin_level", 0)
+
+        cols = st.columns([2, 2, 2, 2, 2, 1])
+        with cols[0]:
+            st.markdown(f'<div class="stat-box"><div class="stat-value">${balance:,.0f}</div><div class="stat-label">Balance</div></div>', unsafe_allow_html=True)
+        with cols[1]:
+            st.markdown(f'<div class="stat-box"><div class="stat-value">${equity:,.0f}</div><div class="stat-label">Equity</div></div>', unsafe_allow_html=True)
+        with cols[2]:
+            color = "#00e676" if floating >= 0 else "#ff5252"
+            st.markdown(f'<div class="stat-box"><div class="stat-value" style="color:{color}">{floating:+,.0f}</div><div class="stat-label">Floating P&L</div></div>', unsafe_allow_html=True)
+        with cols[3]:
+            st.markdown(f'<div class="stat-box"><div class="stat-value">{len(positions)}</div><div class="stat-label">Open Trades</div></div>', unsafe_allow_html=True)
+        with cols[4]:
+            try:
+                from utils.helpers import current_killzone, now_est
+                kz = current_killzone() or "Off Session"
+                est_time = now_est().strftime("%H:%M")
+                st.markdown(f'<div class="stat-box"><div class="stat-value" style="font-size:16px">{kz}</div><div class="stat-label">Killzone · {est_time} EST</div></div>', unsafe_allow_html=True)
+            except Exception:
+                st.markdown(f'<div class="stat-box"><div class="stat-value">—</div><div class="stat-label">Killzone</div></div>', unsafe_allow_html=True)
+        with cols[5]:
+            try:
+                from data.intermarket import IntermarketData
+                im = IntermarketData()
+                snap = im.get_full_snapshot()
+                vix = snap.get("VIX", {}).get("price", "?")
+                st.markdown(f'<div class="stat-box"><div class="stat-value" style="font-size:16px">{vix}</div><div class="stat-label">VIX</div></div>', unsafe_allow_html=True)
+            except Exception:
+                st.markdown(f'<div class="stat-box"><div class="stat-value">—</div><div class="stat-label">VIX</div></div>', unsafe_allow_html=True)
+    except Exception:
+        st.error("MT5 not connected")
+
+
+def _render_potential_trades(results: Dict[str, Any]):
+    """Show only tradeable/high-score instruments as signal cards."""
+    # Sort by QAS descending, then filter tradeable or near-tradeable
+    ranked = []
+    for sym, data in results.items():
+        if data.get("error") and not data.get("signals"):
+            continue
+        ranked.append((sym, data))
+
+    ranked.sort(key=lambda x: (x[1].get("tradeable", False), x[1].get("qas", 0)), reverse=True)
+
+    # Separate into hot (tradeable) and warm (close to tradeable)
+    hot = [(s, d) for s, d in ranked if d.get("tradeable")]
+    warm = [(s, d) for s, d in ranked if not d.get("tradeable") and d.get("avg_score", 0) >= 5.5 and d.get("direction") != "NEUTRAL"]
+
+    if not hot and not warm:
+        st.info("No potential trades detected right now. All instruments are being monitored.")
+        return
+
+    if hot:
+        st.markdown(f"### 🟢 Active Signals — {len(hot)} Trade{'s' if len(hot) != 1 else ''}")
+        for sym, data in hot:
+            inst = data["instrument"]
+            grade = data["grade"]
+            direction = data["direction"]
+            qas = data.get("qas", 0)
+            tws = data.get("tws", 0)
+            regime = data.get("regime", "?")
+            reasons = data.get("reasons", [])
+            weak = data.get("weak", [])
+            evaluation = data.get("evaluation", {})
+
+            card_class = "hot" if grade in ("A+", "A") else "warm"
+            dir_arrow = "▲" if direction == "LONG" else "▼"
+            dir_color = "#00e676" if direction == "LONG" else "#ff5252"
+
+            reasons_html = "".join(f"<div>✓ {r}</div>" for r in reasons)
+            weak_html = "".join(f"<div>⚠ {w}</div>" for w in weak)
+
+            entry_info = ""
+            if evaluation:
+                size_mult = evaluation.get("size_multiplier", 1.0)
+                verdict = evaluation.get("verdict", "")
+                entry_info = f'<div style="margin-top:8px;padding:8px;background:#0a1520;border-radius:6px;font-size:12px;color:#90a4ae">' \
+                             f'Size: <b>{size_mult:.1f}x</b> · Regime: <b>{regime}</b> · QAS: <b>{qas:.3f}</b> · TWS: <b>{tws:.3f}</b>' \
+                             f'{"<br>" + verdict if verdict else ""}</div>'
+
+            layers_html = layer_mini_bars(data.get("signals", []))
+
+            st.markdown(f"""
+            <div class="signal-card {card_class}">
+                <div class="signal-header">
+                    <div>
+                        <span class="signal-name" style="color:{dir_color}">{dir_arrow} {inst.display_name}</span>
+                        <span style="color:#546e7a;margin-left:8px;font-size:13px">{inst.mt5_symbol}</span>
+                        <span style="margin-left:12px">{grade_badge(grade)}</span>
+                    </div>
+                    <div class="inst-price">{format_price(data['price'], inst.pip_size)}</div>
+                </div>
+                <div style="margin:8px 0">{layers_html}</div>
+                <div class="signal-reason">
+                    <b style="color:#81c784">Strengths:</b> {reasons_html if reasons_html else '<div>—</div>'}
+                    {f'<b style="color:#ef9a9a;margin-top:4px;display:block">Risks:</b>{weak_html}' if weak_html else ''}
+                </div>
+                {entry_info}
+            </div>
+            """, unsafe_allow_html=True)
+
+    if warm:
+        st.markdown(f"### 🟡 Watchlist — {len(warm)} Developing")
+        for sym, data in warm[:5]:
+            inst = data["instrument"]
+            direction = data["direction"]
+            avg = data.get("avg_score", 0)
+            reasons = data.get("reasons", [])
+            dir_color = "#ffc107"
+            dir_arrow = "▲" if direction == "LONG" else "▼"
+
+            reasons_text = " · ".join(reasons[:2]) if reasons else "Building confluence..."
+
+            st.markdown(f"""
+            <div class="signal-card warm" style="padding:12px 16px">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                    <div>
+                        <span style="font-size:16px;font-weight:700;color:{dir_color}">{dir_arrow} {inst.display_name}</span>
+                        <span style="color:#546e7a;margin-left:8px;font-size:12px">{inst.category.upper()}</span>
+                        <span style="margin-left:10px">{grade_badge(data['grade'])}</span>
+                    </div>
+                    <div style="text-align:right">
+                        <span class="inst-price" style="font-size:15px">{format_price(data['price'], inst.pip_size)}</span>
+                        <span style="color:#78909c;margin-left:8px;font-size:12px">avg {avg:.1f}/10</span>
+                    </div>
+                </div>
+                <div style="color:#90a4ae;font-size:12px;margin-top:4px">{reasons_text}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+
+def _render_market_grid(results: Dict[str, Any], category_filter: str = "ALL"):
+    """Compact grid of all instruments."""
+    from config.settings import LAYER_PASS_THRESHOLD
+
+    items = []
+    for sym, data in results.items():
+        inst = data.get("instrument")
+        if not inst:
+            continue
+        if category_filter != "ALL" and inst.category.lower() != category_filter.lower():
+            continue
+        items.append((sym, data))
+
+    # Sort: tradeable first, then by avg_score desc
+    items.sort(key=lambda x: (x[1].get("tradeable", False), x[1].get("avg_score", 0)), reverse=True)
+
+    if not items:
+        st.info("No instruments in this category")
+        return
+
+    # Build dataframe for clean table display
+    rows = []
+    for sym, data in items:
+        inst = data["instrument"]
+        direction = data.get("direction", "NEUTRAL")
+        grade = data.get("grade", "---")
+        avg_score = data.get("avg_score", 0)
+        pass_count = data.get("pass_count", 0)
+        total = data.get("total_layers", 0)
+        qas = data.get("qas", 0)
+        regime = data.get("regime", "?")
+        tradeable = data.get("tradeable", False)
+        price = data.get("price", 0)
+
+        # Direction indicator
+        if direction == "LONG":
+            dir_str = "🟢 LONG"
+        elif direction == "SHORT":
+            dir_str = "🔴 SHORT"
+        else:
+            dir_str = "⚪ —"
+
+        # Grade emoji
+        grade_str = {"A+": "🏆 A+", "A": "✅ A", "B": "🟡 B"}.get(grade, "⛔ NO")
+
+        # Tradeable
+        trade_str = "✅" if tradeable else ""
+
+        # Top signal
+        signals = data.get("signals", [])
+        top_sig = ""
+        if signals:
+            best = max(signals, key=lambda s: s.score)
+            top_sig = f"{best.layer_name.split('_')[0]}:{best.score:.0f}"
+
+        # Weakest signal
+        weak_sig = ""
+        if signals:
+            worst = min(signals, key=lambda s: s.score)
+            weak_sig = f"{worst.layer_name.split('_')[0]}:{worst.score:.0f}"
+
+        rows.append({
+            "": trade_str,
+            "Instrument": inst.display_name,
+            "Price": format_price(price, inst.pip_size),
+            "Dir": dir_str,
+            "Grade": grade_str,
+            "Score": f"{avg_score:.1f}",
+            "Pass": f"{pass_count}/{total}",
+            "QAS": f"{qas:.3f}" if qas else "—",
+            "Regime": regime,
+            "Best": top_sig,
+            "Weak": weak_sig,
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(len(rows) * 38 + 40, 700),
+    )
+
+
+def _render_positions():
+    """Show open positions."""
+    try:
+        from data.mt5_connector import MT5Connector
+        mt5 = MT5Connector()
+        mt5.connect()
+        positions = mt5.get_open_positions()
+        if positions:
+            df = pd.DataFrame(positions)
+            cols = ["ticket", "symbol", "type", "volume", "open_price", "current_price", "sl", "tp", "profit", "comment"]
+            available = [c for c in cols if c in df.columns]
+            if available:
+                df_show = df[available].copy()
+                st.dataframe(df_show, use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No open positions")
+    except Exception as e:
+        st.caption(f"Cannot fetch positions: {e}")
+
+
+# ─── Main Render ──────────────────────────────────────────────────────
+def render():
+    inject_pro_css()
+
+    # ── Title bar ──
+    title_col, refresh_col = st.columns([6, 1])
+    with title_col:
+        st.markdown('<h1 style="margin:0;padding:0;font-size:28px">📡 IFC Pro Monitor</h1>', unsafe_allow_html=True)
+    with refresh_col:
+        auto_refresh = st.toggle("Auto", value=True, key="pro_auto_refresh")
+
+    # ── Account bar ──
+    _render_account_bar()
+    st.markdown("")
+
+    # ── Run analysis ──
+    scan_placeholder = st.empty()
+    with scan_placeholder:
+        with st.spinner("Scanning all instruments..."):
+            results = _scan_all_instruments()
+
+    scan_placeholder.empty()
+
+    # ── Summary stats ──
+    total = len(results)
+    tradeable_count = sum(1 for d in results.values() if d.get("tradeable"))
+    long_count = sum(1 for d in results.values() if d.get("direction") == "LONG" and d.get("avg_score", 0) >= 5.5)
+    short_count = sum(1 for d in results.values() if d.get("direction") == "SHORT" and d.get("avg_score", 0) >= 5.5)
+    errors = sum(1 for d in results.values() if d.get("error") and not d.get("signals"))
+    avg_time = np.mean([d.get("elapsed_ms", 0) for d in results.values() if d.get("elapsed_ms", 0) > 0])
+
+    cols = st.columns([1, 1, 1, 1, 1, 2])
+    with cols[0]:
+        st.metric("Scanned", f"{total - errors}/{total}")
+    with cols[1]:
+        st.metric("Tradeable", str(tradeable_count), delta=f"{tradeable_count}" if tradeable_count else None, delta_color="normal")
+    with cols[2]:
+        st.metric("Long Bias", str(long_count))
+    with cols[3]:
+        st.metric("Short Bias", str(short_count))
+    with cols[4]:
+        st.metric("Avg Scan", f"{avg_time:.0f}ms")
+    with cols[5]:
+        st.caption(f"Last scan: {datetime.now().strftime('%H:%M:%S')}")
+
+    st.markdown("---")
+
+    # ── Main content tabs ──
+    tab_signals, tab_grid, tab_positions = st.tabs(["🎯 Trade Signals", "📊 All Instruments", "💼 Positions"])
+
+    with tab_signals:
+        _render_potential_trades(results)
+
+    with tab_grid:
+        cat_filter = st.radio(
+            "Filter",
+            ["ALL", "forex", "index", "commodity", "crypto", "stock"],
+            horizontal=True,
+            key="grid_cat_filter",
+        )
+        _render_market_grid(results, cat_filter)
+
+    with tab_positions:
+        _render_positions()
+
+    # ── Auto refresh ──
+    if auto_refresh:
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=60_000, limit=None, key="pro_autorefresh_counter")
+        except ImportError:
+            st.sidebar.caption("Install `streamlit-autorefresh` for auto-refresh")
+            time.sleep(60)
+            st.rerun()
